@@ -1676,10 +1676,14 @@
 
       const repositoryRef = useRef(repository);
       repositoryRef.current = repository;
+      const [refreshTick, setRefreshTick] = useState(0);
+      const [refreshing, setRefreshing] = useState(false);
       const cfgSyncRef = useRef({});
       const cfgReadyRef = useRef(false);
       const cfgStateRef = useRef({});
       cfgStateRef.current = { geofence, periods, aiSettings };
+      const localDataRef = useRef({});
+      localDataRef.current = { attendanceLogs, capturesDb, spoofAlerts };
 
       // Config me local badlav hote hi cloud me bhejo
       useEffect(() => {
@@ -1708,9 +1712,30 @@
               .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
               .slice(0, cap);
           });
-        const u1 = FG.subscribe('spoofAlerts', mergeInto(setSpoofAlerts, 'id', 100), 100);
-        const u2 = FG.subscribe('capturesDb', mergeInto(setCapturesDb, 'captureId', 200), 200);
-        const u3 = FG.subscribe('attendanceLogs', mergeInto(setAttendanceLogs, 'id', 150), 150);
+        // Purani (sync se pehle ki) aaj ki entries ko ek baar cloud me upload karo
+        const backfilled = {};
+        const withBackfill = (col, idKey, setter, cap) => {
+          const merge = mergeInto(setter, idKey, cap);
+          return (docs, removed, fromCache) => {
+            if (!fromCache && !backfilled[col]) {
+              backfilled[col] = true;
+              const cloudIds = new Set(docs.map((d) => String(d[idKey])));
+              const today = new Date().toDateString();
+              (localDataRef.current[col] || []).forEach((it) => {
+                if (
+                  it && it.timestamp && !cloudIds.has(String(it[idKey])) &&
+                  new Date(it.timestamp).toDateString() === today
+                ) {
+                  FG.save(col, it[idKey], it);
+                }
+              });
+            }
+            merge(docs, removed);
+          };
+        };
+        const u1 = FG.subscribe('spoofAlerts', withBackfill('spoofAlerts', 'id', setSpoofAlerts, 100), 100);
+        const u2 = FG.subscribe('capturesDb', withBackfill('capturesDb', 'captureId', setCapturesDb, 200), 200);
+        const u3 = FG.subscribe('attendanceLogs', withBackfill('attendanceLogs', 'id', setAttendanceLogs, 150), 150);
         // Students (repository): cloud se merge + pehli baar local naye students upload
         let firstRepo = true;
         const u4 = FG.subscribe('students', (docs, removed, fromCache) => {
@@ -1770,7 +1795,7 @@
           if (!fromCache) cfgReadyRef.current = true;
         }, 20);
         return () => { offStatus(); u1(); u2(); u3(); u4(); u5(); u6(); u7(); };
-      }, []);
+      }, [refreshTick]);
 
       const showNotice = useCallback((msg, tone = 'info') => {
         setToast({ msg, tone });
@@ -1888,6 +1913,19 @@
         );
       }, [periods, showNotice]);
 
+      // Soft refresh: login/logout ya page reload ke bina cloud se latest data dobara laao
+      const handleRefresh = () => {
+        if (refreshing) return;
+        setRefreshing(true);
+        if (window.FGCloud && window.FGCloud.enabled) {
+          setRefreshTick((t) => t + 1);
+          showNotice('Latest data refreshed from the cloud.', 'success');
+        } else {
+          showNotice('Cloud sync is off. Data is stored on this device only.', 'info');
+        }
+        setTimeout(() => setRefreshing(false), 1200);
+      };
+
       const navTabs = [
         { id: 'scanner', label: 'Live AI Scanner', icon: IconCamera, public: true },
         { id: 'captures_db', label: `Attendance Captures DB (${capturesDb.length})`, icon: IconDatabase, public: false },
@@ -1948,6 +1986,15 @@
                 >
                   {isAdmin ? 'Admin Mode' : 'Student Kiosk'}
                 </span>
+
+                <button
+                  onClick={handleRefresh}
+                  className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-[#1E3A8A] text-xs font-semibold bg-slate-50 dark:bg-[#0D1836] hover:bg-slate-100 dark:hover:bg-[#12224A] cursor-pointer flex items-center gap-1.5"
+                  title="Refresh data (logout kiye bina)"
+                >
+                  <span className={refreshing ? 'inline-block animate-spin' : 'inline-block'}>⟳</span>
+                  <span className="hidden sm:inline">Refresh</span>
+                </button>
 
                 <button
                   onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
