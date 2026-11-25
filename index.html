@@ -1017,6 +1017,86 @@
     })();
   </script>
 
+  <!-- ===== Firebase Firestore Cloud Sync (optional: config bharte hi on ho jata hai) ===== -->
+  <script>
+    window.FIREBASE_CONFIG = {
+      apiKey: "AIzaSyBTrPo3ZWL7bpSUx97OJUtJuPOMZpxe9Ws",
+      authDomain: "faceguard-ai-484d9.firebaseapp.com",
+      projectId: "faceguard-ai-484d9",
+      storageBucket: "faceguard-ai-484d9.firebasestorage.app",
+      messagingSenderId: "65208854495",
+      appId: "1:65208854495:web:6f133b421db9b3428e066a",
+      measurementId: "G-0FHKFP2YP0"
+    };
+
+    (function () {
+      const cfg = window.FIREBASE_CONFIG;
+      const enabled = !!(cfg && cfg.apiKey && cfg.projectId && !/^YOUR_/.test(cfg.apiKey) && !/^YOUR_/.test(cfg.projectId));
+      const statusCbs = [];
+      const FG = { enabled, status: enabled ? 'connecting' : 'off' };
+      const setStatus = (st) => { FG.status = st; statusCbs.forEach((cb) => { try { cb(st); } catch (e) {} }); };
+      FG.onStatus = (cb) => { statusCbs.push(cb); cb(FG.status); return () => { const i = statusCbs.indexOf(cb); if (i >= 0) statusCbs.splice(i, 1); }; };
+      const clean = (o) => JSON.parse(JSON.stringify(o));
+
+      let ready = Promise.resolve(null);
+      if (enabled) {
+        const V = '10.12.2';
+        ready = (async () => {
+          try {
+            const [{ initializeApp }, fs] = await Promise.all([
+              import(`https://www.gstatic.com/firebasejs/${V}/firebase-app.js`),
+              import(`https://www.gstatic.com/firebasejs/${V}/firebase-firestore.js`)
+            ]);
+            const app = initializeApp(cfg);
+            let db;
+            try {
+              db = fs.initializeFirestore(app, {
+                localCache: fs.persistentLocalCache(),
+                experimentalAutoDetectLongPolling: true
+              });
+            } catch (e) { db = fs.getFirestore(app); }
+            setStatus('online');
+            return { db, fs };
+          } catch (e) {
+            console.warn('FaceGuard Firebase init failed:', e);
+            setStatus('error');
+            return null;
+          }
+        })();
+      }
+
+      FG.save = async (col, id, data) => {
+        if (!enabled) return false;
+        const c = await ready; if (!c) return false;
+        try { await c.fs.setDoc(c.fs.doc(c.db, col, String(id)), clean(data), { merge: true }); return true; }
+        catch (e) { console.warn('FaceGuard cloud save failed:', col, e); setStatus('error'); return false; }
+      };
+      FG.remove = async (col, ids) => {
+        if (!enabled || !ids || !ids.length) return false;
+        const c = await ready; if (!c) return false;
+        try { await Promise.all(ids.map((id) => c.fs.deleteDoc(c.fs.doc(c.db, col, String(id))))); return true; }
+        catch (e) { console.warn('FaceGuard cloud delete failed:', col, e); return false; }
+      };
+      // cb(docs, removedIds) — live updates
+      FG.subscribe = (col, cb, max = 200) => {
+        if (!enabled) return () => {};
+        let unsub = null, dead = false;
+        ready.then((c) => {
+          if (!c || dead) return;
+          const q = c.fs.query(c.fs.collection(c.db, col), c.fs.orderBy('timestamp', 'desc'), c.fs.limit(max));
+          unsub = c.fs.onSnapshot(q, (snap) => {
+            const removed = [];
+            snap.docChanges().forEach((ch) => { if (ch.type === 'removed') removed.push(ch.doc.id); });
+            cb(snap.docs.map((d) => d.data()), removed);
+            setStatus('online');
+          }, (err) => { console.warn('FaceGuard cloud listen failed:', col, err); setStatus('error'); });
+        });
+        return () => { dead = true; if (unsub) unsub(); };
+      };
+      window.FGCloud = FG;
+    })();
+  </script>
+
   <!-- React & Babel Standalone -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -1036,6 +1116,29 @@
     const PERIOD_MARKED_KEY = 'faceguard_period_marked_v5';
     const PERIOD_SPOOF_BLOCKED_KEY = 'faceguard_period_spoof_blocked_v5';
     const ADMIN_PASSCODE = 'MITS@2026';
+
+    /* ---- Safe persistence: localStorage quota full hone par bhi spoof alerts save hon ---- */
+    function safePersist(key, list, imageField) {
+      const tryWrite = (data) => {
+        try { localStorage.setItem(key, JSON.stringify(data)); return true; }
+        catch (e) { return false; }
+      };
+      if (tryWrite(list)) return true;
+      // Quota full: purane records ki photos hatao (record text/metadata rakho), newest photos rakho
+      if (imageField && Array.isArray(list)) {
+        for (const keep of [20, 8, 3, 0]) {
+          const slim = list.map((it, i) => (i < keep ? it : { ...it, [imageField]: null }));
+          if (tryWrite(slim)) return true;
+        }
+      }
+      // Last resort: sirf latest records
+      if (Array.isArray(list)) {
+        for (const n of [50, 20, 5]) {
+          if (tryWrite(list.slice(0, n).map((it, i) => (i < 3 || !imageField ? it : { ...it, [imageField]: null })))) return true;
+        }
+      }
+      return false;
+    }
 
     const DEFAULT_GEOFENCE = {
       enabled: false,
@@ -1250,8 +1353,8 @@
     /* ---- Helper: Capture Live Snapshot Frame from Video/Canvas ---- */
     function captureStudentSnapshot(sourceCanvas, isSpoof = false) {
       const out = document.createElement('canvas');
-      out.width = 400;
-      out.height = 300;
+      out.width = isSpoof ? 320 : 400;
+      out.height = isSpoof ? 240 : 300;
       const ctx = out.getContext('2d');
       ctx.save();
       if (!isSpoof) {
@@ -1271,7 +1374,7 @@
         out.height - 9
       );
 
-      return out.toDataURL('image/jpeg', 0.85);
+      return out.toDataURL('image/jpeg', isSpoof ? 0.6 : 0.85);
     }
 
     /* ---- Inline SVG Icons ---- */
@@ -1514,11 +1617,13 @@
       }, [attendanceLogs]);
 
       useEffect(() => {
-        try { localStorage.setItem(CAPTURES_DB_KEY, JSON.stringify(capturesDb)); } catch (e) {}
+        safePersist(CAPTURES_DB_KEY, capturesDb, 'capturedPhotoUrl');
       }, [capturesDb]);
 
       useEffect(() => {
-        try { localStorage.setItem(SPOOF_ALERTS_KEY, JSON.stringify(spoofAlerts)); } catch (e) {}
+        if (!safePersist(SPOOF_ALERTS_KEY, spoofAlerts, 'snapshotUrl')) {
+          console.warn('FaceGuard: spoof alerts could not be persisted (storage full).');
+        }
       }, [spoofAlerts]);
 
       useEffect(() => {
@@ -1540,6 +1645,38 @@
       useEffect(() => {
         try { localStorage.setItem(PERIOD_SPOOF_BLOCKED_KEY, JSON.stringify(periodSpoofBlocked)); } catch (e) {}
       }, [periodSpoofBlocked]);
+
+      /* ---- Firebase cloud sync: sab devices ka data merge hota hai ---- */
+      const [cloudStatus, setCloudStatus] = useState(window.FGCloud ? window.FGCloud.status : 'off');
+      useEffect(() => {
+        const FG = window.FGCloud;
+        if (!FG || !FG.enabled) return;
+        const offStatus = FG.onStatus(setCloudStatus);
+        const mergeInto = (setter, idKey, cap) => (docs, removed) =>
+          setter((prev) => {
+            const map = new Map(prev.filter((x) => !removed.includes(x[idKey])).map((x) => [x[idKey], x]));
+            docs.forEach((d) => map.set(d[idKey], { ...(map.get(d[idKey]) || {}), ...d }));
+            return [...map.values()]
+              .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+              .slice(0, cap);
+          });
+        const mergeAlerts = mergeInto(setSpoofAlerts, 'id', 100);
+        const u1 = FG.subscribe('spoofAlerts', (docs, removed) => {
+          mergeAlerts(docs, removed);
+          const blocks = {};
+          docs.forEach((a) => { if (a.targetStudentId && a.periodKey) blocks[`${a.targetStudentId}|${a.periodKey}`] = true; });
+          if (Object.keys(blocks).length) setPeriodSpoofBlocked((prev) => ({ ...prev, ...blocks }));
+        }, 100);
+        const u2 = FG.subscribe('capturesDb', mergeInto(setCapturesDb, 'captureId', 200), 200);
+        const mergeLogs = mergeInto(setAttendanceLogs, 'id', 150);
+        const u3 = FG.subscribe('attendanceLogs', (docs, removed) => {
+          mergeLogs(docs, removed);
+          const marks = {};
+          docs.forEach((l) => { if (l.personId && l.periodKey) marks[`${l.personId}|${l.periodKey}`] = true; });
+          if (Object.keys(marks).length) setPeriodMarked((prev) => ({ ...prev, ...marks }));
+        }, 150);
+        return () => { offStatus(); u1(); u2(); u3(); };
+      }, []);
 
       const showNotice = useCallback((msg, tone = 'info') => {
         setToast({ msg, tone });
@@ -1597,6 +1734,7 @@
           periodKey
         };
 
+        if (window.FGCloud) window.FGCloud.save('attendanceLogs', enrichedRecord.id, enrichedRecord);
         setAttendanceLogs((prev) => [enrichedRecord, ...prev.slice(0, 149)]);
         if (record.capturedPhotoUrl) {
           const dbEntry = {
@@ -1613,6 +1751,7 @@
             referencePhotoUrl: record.referencePhotoUrl,
             deviceLabel: 'Terminal 1 · Live AI Camera'
           };
+          if (window.FGCloud) window.FGCloud.save('capturesDb', dbEntry.captureId, dbEntry);
           setCapturesDb((prev) => [dbEntry, ...prev.slice(0, 199)]);
         }
         showNotice(
@@ -1633,18 +1772,16 @@
 
         const enrichedAlert = {
           ...alertItem,
+          flags: Array.isArray(alertItem.flags) ? alertItem.flags : [],
+          targetStudentId: targetId,
+          studentName: (targetPerson && targetPerson.name) || null,
           periodName,
           periodKey
         };
 
+        if (window.FGCloud) window.FGCloud.save('spoofAlerts', enrichedAlert.id, enrichedAlert);
         setSpoofAlerts((prev) => {
-          if (
-            prev.length > 0 &&
-            prev[0].suspectedTarget === enrichedAlert.suspectedTarget &&
-            Date.now() - new Date(prev[0].timestamp).getTime() < 1500
-          ) {
-            return prev;
-          }
+          if (prev.some((a) => a.id === enrichedAlert.id)) return prev;
           return [enrichedAlert, ...prev.slice(0, 99)];
         });
         showNotice(
@@ -1822,14 +1959,17 @@
                 <AdminCaptureDatabaseView
                   capturesDb={capturesDb}
                   onDeleteCapture={(captureId) => {
+                    if (window.FGCloud) window.FGCloud.remove('capturesDb', [captureId]);
                     setCapturesDb((prev) => prev.filter((item) => item.captureId !== captureId));
                     showNotice('Captured photo deleted from database.', 'info');
                   }}
                   onDeleteSelected={(idsSet) => {
+                    if (window.FGCloud) window.FGCloud.remove('capturesDb', [...idsSet]);
                     setCapturesDb((prev) => prev.filter((item) => !idsSet.has(item.captureId)));
                     showNotice(`Deleted ${idsSet.size} selected photo record(s).`, 'info');
                   }}
                   onClearAllCaptures={() => {
+                    if (window.FGCloud) window.FGCloud.remove('capturesDb', capturesDb.map((c) => c.captureId));
                     setCapturesDb([]);
                     showNotice('All captured attendance photos cleared from database.', 'info');
                   }}
@@ -1908,7 +2048,10 @@
                   aiSettings={aiSettings}
                   onUpdateSettings={setAiSettings}
                   spoofAlerts={spoofAlerts}
-                  onClearSpoofAlerts={() => setSpoofAlerts([])}
+                  onClearSpoofAlerts={() => {
+                    if (window.FGCloud) window.FGCloud.remove('spoofAlerts', spoofAlerts.map((a) => a.id));
+                    setSpoofAlerts([]);
+                  }}
                 />
               ) : (
                 <AdminLoginView
@@ -1922,7 +2065,7 @@
 
           <footer className="border-t border-slate-200 dark:border-[#172548] bg-white dark:bg-[#070E22] py-5 text-xs text-slate-500 dark:text-sky-300/60">
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2">
-              <span>FaceGuard AI · Real-Time Liveness Anti-Spoofing &amp; Attendance Capture Database</span>
+              <span>FaceGuard AI · Real-Time Liveness Anti-Spoofing &amp; Attendance Capture Database · Cloud: {cloudStatus === 'online' ? 'Firebase Synced' : cloudStatus === 'error' ? 'Firebase Error (local only)' : cloudStatus === 'connecting' ? 'Connecting…' : 'Off (local only)'}</span>
               <span className="font-semibold text-slate-700 dark:text-sky-200">
                 Created by Rishi Jain, Sahil Verma, and Shubh Jain
               </span>
