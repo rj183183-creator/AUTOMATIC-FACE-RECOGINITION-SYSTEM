@@ -1087,7 +1087,7 @@
           unsub = c.fs.onSnapshot(q, (snap) => {
             const removed = [];
             snap.docChanges().forEach((ch) => { if (ch.type === 'removed') removed.push(ch.doc.id); });
-            cb(snap.docs.map((d) => d.data()), removed);
+            cb(snap.docs.map((d) => d.data()), removed, snap.metadata.fromCache);
             setStatus('online');
           }, (err) => { console.warn('FaceGuard cloud listen failed:', col, err); setStatus('error'); });
         });
@@ -1139,6 +1139,11 @@
     const PERIOD_MARKED_KEY = 'faceguard_period_marked_v5';
     const PERIOD_SPOOF_BLOCKED_KEY = 'faceguard_period_spoof_blocked_v5';
     const ADMIN_PASSCODE = 'MITS@2026';
+    const sid = (id) => encodeURIComponent(String(id));
+    const stableJson = (v) => JSON.stringify(v, (k, val) =>
+      val && typeof val === 'object' && !Array.isArray(val)
+        ? Object.keys(val).sort().reduce((o, kk) => { o[kk] = val[kk]; return o; }, {})
+        : val);
 
     /* ---- Safe persistence: localStorage quota full hone par bhi spoof alerts save hon ---- */
     function safePersist(key, list, imageField) {
@@ -1669,6 +1674,26 @@
         try { localStorage.setItem(PERIOD_SPOOF_BLOCKED_KEY, JSON.stringify(periodSpoofBlocked)); } catch (e) {}
       }, [periodSpoofBlocked]);
 
+      const repositoryRef = useRef(repository);
+      repositoryRef.current = repository;
+      const cfgSyncRef = useRef({});
+      const cfgReadyRef = useRef(false);
+      const cfgStateRef = useRef({});
+      cfgStateRef.current = { geofence, periods, aiSettings };
+
+      // Config me local badlav hote hi cloud me bhejo
+      useEffect(() => {
+        const FG = window.FGCloud;
+        if (!FG || !FG.enabled || !cfgReadyRef.current) return;
+        [['geofence', geofence], ['periods', periods], ['aiSettings', aiSettings]].forEach(([name, val]) => {
+          const json = stableJson(val);
+          if (json !== cfgSyncRef.current[name]) {
+            cfgSyncRef.current[name] = json;
+            FG.save('config', name, { id: name, value: val, timestamp: new Date().toISOString() });
+          }
+        });
+      }, [geofence, periods, aiSettings]);
+
       /* ---- Firebase cloud sync: sab devices ka data merge hota hai ---- */
       const [cloudStatus, setCloudStatus] = useState(window.FGCloud ? window.FGCloud.status : 'off');
       useEffect(() => {
@@ -1683,22 +1708,68 @@
               .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
               .slice(0, cap);
           });
-        const mergeAlerts = mergeInto(setSpoofAlerts, 'id', 100);
-        const u1 = FG.subscribe('spoofAlerts', (docs, removed) => {
-          mergeAlerts(docs, removed);
-          const blocks = {};
-          docs.forEach((a) => { if (a.targetStudentId && a.periodKey) blocks[`${a.targetStudentId}|${a.periodKey}`] = true; });
-          if (Object.keys(blocks).length) setPeriodSpoofBlocked((prev) => ({ ...prev, ...blocks }));
-        }, 100);
+        const u1 = FG.subscribe('spoofAlerts', mergeInto(setSpoofAlerts, 'id', 100), 100);
         const u2 = FG.subscribe('capturesDb', mergeInto(setCapturesDb, 'captureId', 200), 200);
-        const mergeLogs = mergeInto(setAttendanceLogs, 'id', 150);
-        const u3 = FG.subscribe('attendanceLogs', (docs, removed) => {
-          mergeLogs(docs, removed);
-          const marks = {};
-          docs.forEach((l) => { if (l.personId && l.periodKey) marks[`${l.personId}|${l.periodKey}`] = true; });
-          if (Object.keys(marks).length) setPeriodMarked((prev) => ({ ...prev, ...marks }));
-        }, 150);
-        return () => { offStatus(); u1(); u2(); u3(); };
+        const u3 = FG.subscribe('attendanceLogs', mergeInto(setAttendanceLogs, 'id', 150), 150);
+        // Students (repository): cloud se merge + pehli baar local naye students upload
+        let firstRepo = true;
+        const u4 = FG.subscribe('students', (docs, removed, fromCache) => {
+          setRepository((prev) => {
+            const cloud = new Map(docs.map((d) => [sid(d.id), d]));
+            const kept = prev
+              .filter((st) => !removed.includes(sid(st.id)))
+              .map((st) => (cloud.has(sid(st.id)) ? { ...st, ...cloud.get(sid(st.id)) } : st));
+            const have = new Set(kept.map((st) => sid(st.id)));
+            const fresh = docs.filter((d) => !have.has(sid(d.id)));
+            return [...fresh, ...kept];
+          });
+          if (firstRepo && !fromCache) {
+            firstRepo = false;
+            const cloudIds = new Set(docs.map((d) => sid(d.id)));
+            const defaultIds = new Set(DEFAULT_STUDENTS.map((d) => sid(d.id)));
+            repositoryRef.current.forEach((st) => {
+              if (!cloudIds.has(sid(st.id)) && !defaultIds.has(sid(st.id))) {
+                FG.save('students', sid(st.id), { ...st, timestamp: st.timestamp || new Date().toISOString() });
+              }
+            });
+          }
+        }, 500);
+        // Period marks / spoof blocks (har key ek doc; reset par delete)
+        const keyMerge = (setter) => (docs, removed) =>
+          setter((prev) => {
+            const next = { ...prev };
+            removed.forEach((rid) => { try { delete next[decodeURIComponent(rid)]; } catch (e) {} });
+            docs.forEach((d) => { if (d.key) next[d.key] = true; });
+            return next;
+          });
+        const u5 = FG.subscribe('periodMarks', keyMerge(setPeriodMarked), 500);
+        const u6 = FG.subscribe('periodBlocks', keyMerge(setPeriodSpoofBlocked), 500);
+
+        // Config: geofence, periods, aiSettings
+        const specs = {
+          geofence: (v) => setGeofence(v),
+          periods: (v) => setPeriods(v),
+          aiSettings: (v) => setAiSettings((prev) => ({ ...prev, ...v }))
+        };
+        const u7 = FG.subscribe('config', (docs, removed, fromCache) => {
+          const byId = new Map(docs.map((d) => [d.id, d]));
+          Object.keys(specs).forEach((name) => {
+            const d = byId.get(name);
+            if (d && d.value !== undefined) {
+              const json = stableJson(d.value);
+              if (json !== cfgSyncRef.current[name]) {
+                cfgSyncRef.current[name] = json;
+                specs[name](d.value);
+              }
+            } else if (!fromCache && cfgSyncRef.current[name] === undefined) {
+              const local = cfgStateRef.current[name];
+              cfgSyncRef.current[name] = stableJson(local);
+              FG.save('config', name, { id: name, value: local, timestamp: new Date().toISOString() });
+            }
+          });
+          if (!fromCache) cfgReadyRef.current = true;
+        }, 20);
+        return () => { offStatus(); u1(); u2(); u3(); u4(); u5(); u6(); u7(); };
       }, []);
 
       const showNotice = useCallback((msg, tone = 'info') => {
@@ -1748,6 +1819,7 @@
         }
 
         if (periodKey) {
+          if (window.FGCloud) window.FGCloud.save('periodMarks', sid(`${record.personId}|${periodKey}`), { key: `${record.personId}|${periodKey}`, timestamp: new Date().toISOString() });
           setPeriodMarked((prev) => ({ ...prev, [`${record.personId}|${periodKey}`]: true }));
         }
 
@@ -1790,6 +1862,7 @@
 
         const targetId = alertItem.targetStudentId || (targetPerson && targetPerson.id) || null;
         if (periodKey && targetId) {
+          if (window.FGCloud) window.FGCloud.save('periodBlocks', sid(`${targetId}|${periodKey}`), { key: `${targetId}|${periodKey}`, timestamp: new Date().toISOString() });
           setPeriodSpoofBlocked((prev) => ({ ...prev, [`${targetId}|${periodKey}`]: true }));
         }
 
@@ -2011,10 +2084,17 @@
                 <StudentEnrollmentView
                   repository={repository}
                   onAddStudent={(stu) => {
+                    if (window.FGCloud) window.FGCloud.save('students', sid(stu.id), { ...stu, timestamp: new Date().toISOString() });
                     setRepository((prev) => [stu, ...prev]);
                     showNotice(`Enrolled ${stu.name} (${stu.id}) into biometric repository.`, 'success');
                   }}
                   onImportBulk={(importedList) => {
+                    if (window.FGCloud) {
+                      const have = new Set(repository.map((x) => String(x.id).toLowerCase()));
+                      importedList
+                        .filter((x) => !have.has(String(x.id).toLowerCase()))
+                        .forEach((x) => window.FGCloud.save('students', sid(x.id), { ...x, timestamp: new Date().toISOString() }));
+                    }
                     setRepository((prev) => {
                       const existingIds = new Set(prev.map((s) => String(s.id).toLowerCase()));
                       const fresh = importedList.filter((s) => !existingIds.has(String(s.id).toLowerCase()));
@@ -2023,12 +2103,18 @@
                     showNotice(`Imported ${importedList.length} profile(s) into repository.`, 'success');
                   }}
                   onUpdateStudent={(oldId, updatedFields) => {
+                    if (window.FGCloud) {
+                      const merged = { ...(repository.find((x) => x.id === oldId) || {}), ...updatedFields };
+                      if (String(merged.id) !== String(oldId)) window.FGCloud.remove('students', [sid(oldId)]);
+                      window.FGCloud.save('students', sid(merged.id), { ...merged, timestamp: new Date().toISOString() });
+                    }
                     setRepository((prev) =>
                       prev.map((s) => (s.id === oldId ? { ...s, ...updatedFields } : s))
                     );
                     showNotice(`Updated profile for ${updatedFields.name}.`, 'success');
                   }}
                   onDeleteStudent={(id) => {
+                    if (window.FGCloud) window.FGCloud.remove('students', [sid(id)]);
                     setRepository((prev) => prev.filter((s) => s.id !== id));
                     showNotice('Profile removed from repository.', 'info');
                   }}
@@ -2051,6 +2137,10 @@
                   periods={periods}
                   onUpdatePeriods={setPeriods}
                   onResetPeriodMarks={() => {
+                    if (window.FGCloud) {
+                      window.FGCloud.remove('periodMarks', Object.keys(periodMarked).map(sid));
+                      window.FGCloud.remove('periodBlocks', Object.keys(periodSpoofBlocked).map(sid));
+                    }
                     setPeriodMarked({});
                     setPeriodSpoofBlocked({});
                     showNotice('All attendance & spoof period locks reset.', 'info');
