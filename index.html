@@ -1094,6 +1094,29 @@
         return () => { dead = true; if (unsub) unsub(); };
       };
       window.FGCloud = FG;
+
+      /* ---- Hamesha dikhne wala cloud status badge (neeche-right kone me) ---- */
+      const mountBadge = () => {
+        const b = document.createElement('div');
+        b.id = 'fg-cloud-badge';
+        b.style.cssText = 'position:fixed;right:10px;bottom:10px;z-index:99999;padding:6px 10px;border-radius:999px;font:600 11px system-ui,sans-serif;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.35);cursor:pointer;';
+        const paint = (st) => {
+          const map = {
+            online: ['#059669', '☁ Firebase Synced'],
+            connecting: ['#d97706', '☁ Firebase Connecting…'],
+            error: ['#dc2626', '☁ Firebase Error — console (F12) dekho'],
+            off: ['#475569', '☁ Cloud Off (local only)']
+          };
+          const [bg, txt] = map[st] || map.off;
+          b.style.background = bg; b.textContent = txt;
+        };
+        b.title = 'Click to hide';
+        b.onclick = () => b.remove();
+        FG.onStatus(paint);
+        document.body.appendChild(b);
+      };
+      if (document.body) mountBadge(); else document.addEventListener('DOMContentLoaded', mountBadge);
+      console.log('FaceGuard cloud:', enabled ? 'enabled (project ' + cfg.projectId + ')' : 'disabled (config missing)');
     })();
   </script>
 
